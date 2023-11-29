@@ -5,6 +5,7 @@ import logging
 import multiprocessing
 import os
 import random
+import re
 from contextlib import closing
 from multiprocessing.pool import Pool
 from typing import Optional
@@ -34,7 +35,7 @@ DATASET_FILE = "dataset.tf"
 # global variables used in pool workers
 _dump_db = _tokenizer = _sentence_splitter = _entity_vocab = _max_num_tokens = _max_entity_length = None
 _max_mention_length = _min_sentence_length = _include_sentences_without_entities = _include_unk_entities = None
-_abstract_only = _language = None
+_abstract_only = _language = _add_distantly_supervised_links = _min_distantly_supervised_link_text_length = None
 
 
 @click.command()
@@ -51,6 +52,8 @@ _abstract_only = _language = None
 @click.option("--abstract-only", is_flag=True)
 @click.option("--include-sentences-without-entities", is_flag=True)
 @click.option("--include-unk-entities/--skip-unk-entities", default=False)
+@click.option("--add-distantly-supervised-links", is_flag=True)
+@click.option("--min-distantly-supervised-link-text-length", default=2)
 @click.option("--pool-size", default=multiprocessing.cpu_count())
 @click.option("--chunk-size", default=100)
 @click.option("--max-num-documents", default=None, type=int)
@@ -179,6 +182,8 @@ class WikipediaPretrainingDataset:
         abstract_only: bool,
         include_sentences_without_entities: bool,
         include_unk_entities: bool,
+        add_distantly_supervised_links: bool,
+        min_distantly_supervised_link_text_length: int,
         pool_size: int,
         chunk_size: int,
         max_num_documents: Optional[int],
@@ -222,6 +227,8 @@ class WikipediaPretrainingDataset:
                     abstract_only,
                     include_sentences_without_entities,
                     include_unk_entities,
+                    add_distantly_supervised_links,
+                    min_distantly_supervised_link_text_length,
                 )
                 with closing(
                     Pool(pool_size, initializer=WikipediaPretrainingDataset._initialize_worker, initargs=initargs)
@@ -263,11 +270,15 @@ class WikipediaPretrainingDataset:
         abstract_only: bool,
         include_sentences_without_entities: bool,
         include_unk_entities: bool,
+        add_distantly_supervised_links: bool,
+        min_distantly_supervised_link_text_length: int,
     ):
         global _dump_db, _tokenizer, _sentence_splitter, _entity_vocab, _max_num_tokens, _max_entity_length
         global _max_mention_length, _min_sentence_length, _include_sentences_without_entities, _include_unk_entities
         global _abstract_only
         global _language
+        global _add_distantly_supervised_links
+        global _min_distantly_supervised_link_text_length
 
         _dump_db = dump_db
         _tokenizer = tokenizer
@@ -281,6 +292,8 @@ class WikipediaPretrainingDataset:
         _include_unk_entities = include_unk_entities
         _abstract_only = abstract_only
         _language = language
+        _add_distantly_supervised_links = add_distantly_supervised_links
+        _min_distantly_supervised_link_text_length = min_distantly_supervised_link_text_length
 
     @staticmethod
     def _process_page(page_title: str):
@@ -290,6 +303,32 @@ class WikipediaPretrainingDataset:
             page_id = -1
 
         sentences = []
+
+        if _add_distantly_supervised_links:
+            # Gather all links present in the page
+            page_links = []
+            for paragraph in _dump_db.get_paragraphs(page_title):
+                if _abstract_only and not paragraph.abstract:
+                    continue
+
+                for link in paragraph.wiki_links:
+                    if len(link.text) < _min_distantly_supervised_link_text_length:
+                        continue
+
+                    link_title = _dump_db.resolve_redirect(link.title)
+                    if link_title.startswith("Category:") and link.text.lower().startswith("category:"):
+                        continue
+                    if not _entity_vocab.contains(link_title, _language):
+                        continue
+
+                    link = (link.text, link_title)
+                    if link in page_links:
+                        continue
+
+                    page_links.append(link)
+
+            # Sort the links by text length (longest first)
+            page_links = sorted(page_links, key=lambda x: len(x[0]), reverse=True)
 
         for paragraph in _dump_db.get_paragraphs(page_title):
 
@@ -314,6 +353,21 @@ class WikipediaPretrainingDataset:
                         paragraph_links.append((link_title, link.start, link.end))
                     elif _include_unk_entities:
                         paragraph_links.append((UNK_TOKEN, link.start, link.end))
+
+            if _add_distantly_supervised_links:
+                # Add distantly supervised links from the page
+                for link_text, link_title in page_links:
+                    for match in re.finditer(re.escape(link_text), paragraph_text):
+                        ds_start, ds_end = match.start(), match.end()
+                        for _, start, end in paragraph_links:
+                            # Ignore overlapping links
+                            if start < ds_end or ds_start < end:
+                                break
+                        else:
+                            paragraph_links.append((link_title, ds_start, ds_end))
+
+                # Sort the updated links by start position
+                paragraph_links = sorted(paragraph_links, key=lambda x: x[1])
 
             sent_spans = _sentence_splitter.get_sentence_spans(paragraph_text.rstrip())
             for sent_start, sent_end in sent_spans:
