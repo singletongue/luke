@@ -96,6 +96,11 @@ def remove_entity_embeddings_from_luke(
     is_flag=True,
     help="If true, the entity embeddings will be removed to make a lite-weight model.",
 )
+@click.option(
+    "--remove-language-from-entity-vocab",
+    is_flag=True,
+    help="If true, the language specifiers will be removed from the entity vocabulary.",
+)
 def convert_luke_to_huggingface_model(
     checkpoint_path: str,
     metadata_path: str,
@@ -104,6 +109,7 @@ def convert_luke_to_huggingface_model(
     tokenizer_class: str,
     set_entity_aware_attention_default: bool,
     remove_entity_embeddings: bool,
+    remove_language_from_entity_vocab: bool,
 ):
     # Load configuration defined in the metadata file
     with open(metadata_path) as metadata_file:
@@ -131,7 +137,7 @@ def convert_luke_to_huggingface_model(
         print("RoBERTa weights are loaded from the checkpoint")
 
     # Load the entity vocab file
-    entity_vocab = load_original_entity_vocab(entity_vocab_path)
+    entity_vocab = load_original_entity_vocab(entity_vocab_path, remove_language=remove_language_from_entity_vocab)
     # add an entry for [MASK2]
     entity_vocab["[MASK2]"] = max(entity_vocab.values()) + 1
     config.entity_vocab_size += 1
@@ -233,7 +239,7 @@ def convert_luke_to_huggingface_model(
     tokenizer.save_pretrained(transformers_model_save_path)
 
 
-def load_original_entity_vocab(entity_vocab_path):
+def load_original_entity_vocab(entity_vocab_path, remove_language: bool = False):
     SPECIAL_TOKENS = ["[MASK]", "[PAD]", "[UNK]"]
 
     data = [json.loads(line) for line in open(entity_vocab_path)]
@@ -245,7 +251,15 @@ def load_original_entity_vocab(entity_vocab_path):
             if entity_name in SPECIAL_TOKENS:
                 new_mapping[entity_name] = entity_id
                 break
-            new_entity_name = f"{language}:{entity_name}"
+
+            if remove_language:
+                new_entity_name = entity_name
+            else:
+                new_entity_name = f"{language}:{entity_name}"
+
+            if new_entity_name in new_mapping:
+                raise KeyError(f"Duplicated entity name: {new_entity_name}")
+
             new_mapping[new_entity_name] = entity_id
     return new_mapping
 
