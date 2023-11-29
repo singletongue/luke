@@ -8,7 +8,10 @@ import torch
 from transformers import LukeConfig, LukeForMaskedLM, AutoTokenizer, LukeTokenizer, MLukeTokenizer
 from transformers.tokenization_utils_base import AddedToken
 
-LukeTokenizerType = TypeVar("LukeTokenizerType", bound=Union[LukeTokenizer, MLukeTokenizer])
+from .hf_model.tokenization_luke_bert_japanese import LukeBertJapaneseTokenizer
+
+
+LukeTokenizerType = TypeVar("LukeTokenizerType", bound=Union[LukeTokenizer, MLukeTokenizer, LukeBertJapaneseTokenizer])
 
 
 def remove_entity_embeddings_from_luke(
@@ -78,7 +81,7 @@ def remove_entity_embeddings_from_luke(
 )
 @click.option(
     "--tokenizer-class",
-    type=click.Choice(["LukeTokenizer", "MLukeTokenizer"]),
+    type=click.Choice(["LukeTokenizer", "MLukeTokenizer", "LukeBertJapaneseTokenizer"]),
     help="The Tokenizer class to use in transformers.",
     required=True,
 )
@@ -93,6 +96,11 @@ def remove_entity_embeddings_from_luke(
     is_flag=True,
     help="If true, the entity embeddings will be removed to make a lite-weight model.",
 )
+@click.option(
+    "--remove-language-from-entity-vocab",
+    is_flag=True,
+    help="If true, the language specifiers will be removed from the entity vocabulary.",
+)
 def convert_luke_to_huggingface_model(
     checkpoint_path: str,
     metadata_path: str,
@@ -101,6 +109,7 @@ def convert_luke_to_huggingface_model(
     tokenizer_class: str,
     set_entity_aware_attention_default: bool,
     remove_entity_embeddings: bool,
+    remove_language_from_entity_vocab: bool,
 ):
     # Load configuration defined in the metadata file
     with open(metadata_path) as metadata_file:
@@ -110,8 +119,25 @@ def convert_luke_to_huggingface_model(
     # Load in the weights from the checkpoint_path
     state_dict = torch.load(checkpoint_path, map_location="cpu")["module"]
 
+    ckpt_is_bert = any(key.startswith("cls.") for key in state_dict.keys())
+    if ckpt_is_bert:
+        print("BERT weights are loaded from the checkpoint")
+        # Convert some weight keys
+        state_dict["lm_head.dense.weight"] = state_dict.pop("cls.predictions.transform.dense.weight")
+        state_dict["lm_head.dense.bias"] = state_dict.pop("cls.predictions.transform.dense.bias")
+        state_dict["lm_head.layer_norm.weight"] = state_dict.pop("cls.predictions.transform.LayerNorm.weight")
+        state_dict["lm_head.layer_norm.bias"] = state_dict.pop("cls.predictions.transform.LayerNorm.bias")
+        state_dict["lm_head.decoder.weight"] = state_dict.pop("cls.predictions.decoder.weight")
+        state_dict["lm_head.decoder.bias"] = state_dict.pop("cls.predictions.decoder.bias")
+        state_dict["lm_head.bias"] = state_dict.pop("cls.predictions.bias")
+        # Discard unnecessary weights
+        state_dict.pop("cls.seq_relationship.weight")
+        state_dict.pop("cls.seq_relationship.bias")
+    else:
+        print("RoBERTa weights are loaded from the checkpoint")
+
     # Load the entity vocab file
-    entity_vocab = load_original_entity_vocab(entity_vocab_path)
+    entity_vocab = load_original_entity_vocab(entity_vocab_path, remove_language=remove_language_from_entity_vocab)
     # add an entry for [MASK2]
     entity_vocab["[MASK2]"] = max(entity_vocab.values()) + 1
     config.entity_vocab_size += 1
@@ -135,7 +161,11 @@ def convert_luke_to_huggingface_model(
     with open(os.path.join(transformers_model_save_path, "entity_vocab.json"), "w") as f:
         json.dump(entity_vocab, f)
 
-    tokenizer = AutoTokenizer.from_pretrained(transformers_model_save_path)
+    if tokenizer_class == "LukeBertJapaneseTokenizer":
+        LukeBertJapaneseTokenizer.register_for_auto_class()
+        tokenizer = LukeBertJapaneseTokenizer.from_pretrained(transformers_model_save_path)
+    else:
+        tokenizer = AutoTokenizer.from_pretrained(transformers_model_save_path)
 
     # Initialize the embeddings of the special tokens
     ent_init_index = tokenizer.convert_tokens_to_ids(["@"])[0]
@@ -186,7 +216,7 @@ def convert_luke_to_huggingface_model(
 
     missing_keys, unexpected_keys = model.load_state_dict(state_dict_for_hugging_face, strict=False)
 
-    if set(unexpected_keys) != {"luke.embeddings.position_ids"}:
+    if unexpected_keys != []:
         raise ValueError(f"Unexpected unexpected_keys: {unexpected_keys}")
     if set(missing_keys) != {
         "lm_head.decoder.weight",
@@ -209,7 +239,7 @@ def convert_luke_to_huggingface_model(
     tokenizer.save_pretrained(transformers_model_save_path)
 
 
-def load_original_entity_vocab(entity_vocab_path):
+def load_original_entity_vocab(entity_vocab_path, remove_language: bool = False):
     SPECIAL_TOKENS = ["[MASK]", "[PAD]", "[UNK]"]
 
     data = [json.loads(line) for line in open(entity_vocab_path)]
@@ -221,7 +251,15 @@ def load_original_entity_vocab(entity_vocab_path):
             if entity_name in SPECIAL_TOKENS:
                 new_mapping[entity_name] = entity_id
                 break
-            new_entity_name = f"{language}:{entity_name}"
+
+            if remove_language:
+                new_entity_name = entity_name
+            else:
+                new_entity_name = f"{language}:{entity_name}"
+
+            if new_entity_name in new_mapping:
+                raise KeyError(f"Duplicated entity name: {new_entity_name}")
+
             new_mapping[new_entity_name] = entity_id
     return new_mapping
 
